@@ -74,7 +74,7 @@ local function GetDecimalFormatter(thr)
     -- live at the BREAKPOINT level; components carry only the divisor. Off-shape tables
     -- get silently rejected or default-rounded by the validator -- do not restyle.
     local points = {
-        { threshold = 0, format = "%.1f", rounding = Nearest },
+        { threshold = 0, format = "%.1f", rounding = Nearest, step = 0.1 },
     }
     if thr <= 59 then
         points[#points + 1] = { threshold = thr, format = "%d", rounding = Up, step = 1 }
@@ -157,6 +157,9 @@ local container      -- live AuraContainer, or nil
 local signature      -- signature string of the live container's slot set
 local boundIndex = {}   -- bar index -> slot button (rebuilt per container)
 local boundThr = {}     -- bar index -> threshold its binding was registered with
+local directIndex = {}  -- bar index -> matched Blizzard CooldownViewer aura button
+local directFS = {}     -- bar index -> engine-written FS parented to that button
+local directThr = {}
 local pendingRegen      -- true while a combat-deferred rebuild is queued
 local regenFrame
 
@@ -176,6 +179,9 @@ local function UnmarkAll()
     end
     wipe(boundIndex)
     wipe(boundThr)
+    wipe(directIndex)
+    wipe(directFS)
+    wipe(directThr)
 end
 
 local function ReleaseCurrent()
@@ -250,15 +256,17 @@ end
 
 local function BuildContainer(desired)
     if not host then
-        -- Shown but invisible: the engine only processes VISIBLE containers,
-        -- and the noRegions slot buttons render nothing anyway. Alpha 0 on
-        -- the host is belt-and-braces; it does not reach the bound timer
-        -- FontStrings (they live on the TBB bars, not in this tree).
+        -- Keep the proxy renderable so the engine continues processing its aura
+        -- slots and duration text. The bound FontStrings are descendants of this
+        -- host, so setting the host to alpha zero can suppress their updates.
+        -- Keep the proxy on-screen; off-screen AuraContainers can be culled
+        -- before their engine-managed aura and duration bindings are advanced.
         host = CreateFrame("Frame", nil, UIParent)
-        host:SetSize(1, 1)
-        host:SetPoint("BOTTOMLEFT", UIParent, "BOTTOMLEFT", 0, 0)
+        -- Match the suite's proven engine-text proxies: a meaningful renderable
+        -- rectangle is required even though its presentation is transparent.
+        host:SetSize(80, 20)
+        host:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
         host:SetFrameStrata("BACKGROUND")
-        host:SetAlpha(0)
         host:EnableMouse(false)
     end
 
@@ -274,6 +282,10 @@ local function BuildContainer(desired)
             candidateFilters = { includeSpellIDs = want.include },
             style = "tbbDecimalText",
             extraInit = function(button)
+                -- Match the suite's working engine-proxy pattern: give the slot a
+                -- renderable, two-point anchored rect before duration registration.
+                button:SetAllPoints(host)
+                if button.SetMouseClickEnabled then button:SetMouseClickEnabled(false) end
                 if button.SetMouseMotionEnabled then button:SetMouseMotionEnabled(false) end
                 local fmt = GetDecimalFormatter(want.thr)
                 if not fmt then return end -- rejected: tick keeps its mirror
@@ -284,21 +296,25 @@ local function BuildContainer(desired)
                 -- the tick copies its string to the bar's real timer FS. Same
                 -- carrier arrangement as the standard AuraKit regions; fonted
                 -- BEFORE registration (style-before-register contract). It is
-                -- never rendered (alpha-0 host); only its string is read.
+                -- never presented on-screen (the proxy is off-screen); only its string is read.
                 local carrier = CreateFrame("Frame", nil, button)
                 carrier:SetAllPoints(button)
                 local fs = carrier:CreateFontString(nil, "OVERLAY")
                 fs:SetFont((ns.GetCDMFont and ns.GetCDMFont())
                     or "Interface\\AddOns\\EllesmereUI\\media\\fonts\\Expressway.TTF", 12, "")
                 fs:SetPoint("CENTER", button, "CENTER", 0, 0)
-                -- 68914 schema: updateInterval is a binding-level knob now,
-                -- so the formatter + 0.05s interval travel on a configured
-                -- DurationTextBinding via options.binding (BuildDurationTextOpts).
-                AK.SetDurationTextSafe(button, fs, AK.BuildDurationTextOpts(fmt, nil, 0.05))
-                boundIndex[want.index] = button
-                boundThr[want.index] = want.thr
-                bar._tbbEngineText = button
-                bar._tbbEngineFS = fs
+                fs:SetAlpha(0.001)
+                -- Use the plain textFormatter option. The optional custom binding can
+                -- be rejected by some clients; SetDurationTextSafe then succeeds with
+                -- a bare options table, silently producing Blizzard's whole numbers.
+                -- Only advertise this as a decimal source when the full formatter lands.
+                local _, full = AK.SetDurationTextSafe(button, fs, AK.BuildDurationTextOpts(fmt))
+                if full then
+                    boundIndex[want.index] = button
+                    boundThr[want.index] = want.thr
+                    bar._tbbEngineText = button
+                    bar._tbbEngineFS = fs
+                end
             end,
         }
     end
@@ -311,6 +327,50 @@ local function BuildContainer(desired)
         point = { "BOTTOMLEFT", host, "BOTTOMLEFT", 0, 0 },
         slots = slots,
     })
+    container:SetFrameLevel(host:GetFrameLevel() + 1)
+end
+
+-- Prefer the already-matched Blizzard CooldownViewer aura button as the
+-- duration owner. It is the exact aura driving the Tracking Bar and already
+-- carries the protected duration, so no duplicate aura filter is required.
+local function BindDirect(want)
+    local bar = ns.GetTBBFrame and ns.GetTBBFrame(want.index)
+    local tbb = ns.GetTrackedBuffBars and ns.GetTrackedBuffBars()
+    local cfg = tbb and tbb.bars and tbb.bars[want.index]
+    local button = cfg and ns.FindTBBChild and ns.FindTBBChild(cfg)
+    if not (bar and bar._timerText and button and button.SetDurationText) then return false end
+
+    if directIndex[want.index] == button and directFS[want.index]
+       and directThr[want.index] == want.thr then
+        bar._tbbEngineText = button
+        bar._tbbEngineFS = directFS[want.index]
+        return true
+    end
+    if InCombatLockdown() then return false end
+
+    local fmt = GetDecimalFormatter(want.thr)
+    if not fmt then return false end
+    local fs
+    local okCreate = pcall(function()
+        local carrier = CreateFrame("Frame", nil, button)
+        carrier:SetAllPoints(button)
+        carrier:SetFrameLevel(button:GetFrameLevel() + 5)
+        fs = carrier:CreateFontString(nil, "OVERLAY")
+        fs:SetFont((ns.GetCDMFont and ns.GetCDMFont())
+            or "Interface\\AddOns\\EllesmereUI\\media\\fonts\\Expressway.TTF", 12, "")
+        fs:SetPoint("CENTER", button, "CENTER", 0, 0)
+        fs:SetAlpha(0.001)
+    end)
+    if not okCreate or not fs then return false end
+
+    local _, full = AK.SetDurationTextSafe(button, fs, AK.BuildDurationTextOpts(fmt))
+    if not full then return false end
+    directIndex[want.index] = button
+    directFS[want.index] = fs
+    directThr[want.index] = want.thr
+    bar._tbbEngineText = button
+    bar._tbbEngineFS = fs
+    return true
 end
 
 function ns.TBBDecimals_Sync()
@@ -334,17 +394,19 @@ function ns.TBBDecimals_Sync()
             local want = desired[n]
             local button = boundIndex[want.index]
             local bar = ns.GetTBBFrame and ns.GetTBBFrame(want.index)
+            BindDirect(want)
             if button and bar then
-                bar._tbbEngineText = button
-                if bar._tbbEngineFS and boundThr[want.index] ~= want.thr then
+                if directIndex[want.index] == nil then bar._tbbEngineText = button end
+                if directIndex[want.index] == nil and bar._tbbEngineFS
+                   and boundThr[want.index] ~= want.thr then
                     local fmt = GetDecimalFormatter(want.thr)
                     if fmt then
                         -- Stamp only on success: SetDurationTextSafe never throws
                         -- anymore, and a denied re-registration under restriction must
                         -- stay unstamped so a later Sync retries it.
-                        local ok = AK.SetDurationTextSafe(button, bar._tbbEngineFS,
-                            AK.BuildDurationTextOpts(fmt, nil, 0.05))
-                        if ok then boundThr[want.index] = want.thr end
+                        local _, full = AK.SetDurationTextSafe(button, bar._tbbEngineFS,
+                            AK.BuildDurationTextOpts(fmt))
+                        if full then boundThr[want.index] = want.thr end
                     end
                 end
             end
@@ -377,5 +439,93 @@ function ns.TBBDecimals_Sync()
 
     BuildContainer(desired)
     signature = container and sig or nil
+    for n = 1, #desired do BindDirect(desired[n]) end
 end
+
+-- Temporary runtime diagnostics for the Tracking Bar decimal pipeline.
+-- Usage: /asdebug while the tracked buff is active.
+local function DebugPlain(v)
+    if v == nil then return "nil" end
+    if issecretvalue and issecretvalue(v) then return "<secret>" end
+    return tostring(v)
+end
+
+function ns.TBBDecimals_Debug()
+    local out = DEFAULT_CHAT_FRAME
+    local function say(msg) out:AddMessage("|cff0cd29fTBB decimals:|r " .. msg) end
+    local desired, sig = CollectDesired()
+    say("AK=" .. DebugPlain(AK ~= nil)
+        .. " container=" .. DebugPlain(container ~= nil)
+        .. " signature=" .. DebugPlain(signature)
+        .. " desiredSignature=" .. DebugPlain(sig))
+    if not desired then
+        say("No enabled aura Tracking Bars currently have Decimals enabled.")
+        return
+    end
+    for n = 1, #desired do
+        local want = desired[n]
+        local tbb = ns.GetTrackedBuffBars and ns.GetTrackedBuffBars()
+        local cfg = tbb and tbb.bars and tbb.bars[want.index]
+        local bar = ns.GetTBBFrame and ns.GetTBBFrame(want.index)
+        local blizz = cfg and ns.FindTBBChild and ns.FindTBBChild(cfg)
+        local engFS = bar and bar._tbbEngineFS
+        local engBtn = bar and bar._tbbEngineText
+        local okText, engText = false, nil
+        if engFS then okText, engText = pcall(engFS.GetText, engFS) end
+        local okShown, btnShown = false, nil
+        if engBtn then okShown, btnShown = pcall(engBtn.IsShown, engBtn) end
+
+        -- IsShown() is secret for engine aura slots, so render its value through
+        -- the engine-safe alpha setter instead of branching on or printing it.
+        if engBtn and engBtn.IsShown and UIParent then
+            local indicator = ns._tbbDecimalDebugIndicator
+            if not indicator then
+                indicator = CreateFrame("Frame", nil, UIParent)
+                indicator:SetSize(260, 30)
+                indicator:SetPoint("TOP", UIParent, "TOP", 0, -120)
+                indicator:SetFrameStrata("TOOLTIP")
+                local label = indicator:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+                label:SetPoint("RIGHT", indicator, "CENTER", -4, 0)
+                label:SetText("AS decimal slot:")
+                local active = indicator:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+                active:SetPoint("LEFT", indicator, "CENTER", 4, 0)
+                active:SetText("|cff00ff00ACTIVE|r")
+                local inactive = indicator:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+                inactive:SetPoint("LEFT", indicator, "CENTER", 4, 0)
+                inactive:SetText("|cffff4040INACTIVE|r")
+                indicator.active = active
+                indicator.inactive = inactive
+                ns._tbbDecimalDebugIndicator = indicator
+            end
+            indicator:Show()
+            if indicator.active.SetAlphaFromBoolean then
+                local state = engBtn:IsShown()
+                indicator.active:SetAlphaFromBoolean(state, 1, 0)
+                indicator.inactive:SetAlphaFromBoolean(state, 0, 1)
+            end
+            C_Timer.After(10, function() indicator:Hide() end)
+        end
+        local idCount = 0
+        for _ in pairs(want.include) do idCount = idCount + 1 end
+        say("bar " .. want.index
+            .. " name=" .. DebugPlain(cfg and cfg.name)
+            .. " spellID=" .. DebugPlain(cfg and cfg.spellID)
+            .. " threshold=" .. DebugPlain(want.thr)
+            .. " formatter=" .. DebugPlain(GetDecimalFormatter(want.thr) ~= nil)
+            .. " ids=" .. idCount)
+        say("  BlizzardFrame=" .. DebugPlain(blizz ~= nil)
+            .. " cooldownID=" .. DebugPlain(blizz and blizz.cooldownID)
+            .. " SetDurationText=" .. DebugPlain(blizz and blizz.SetDurationText ~= nil)
+            .. " direct=" .. DebugPlain(directIndex[want.index] == blizz)
+            .. " boundButton=" .. DebugPlain(engBtn ~= nil)
+            .. " shownOK=" .. DebugPlain(okShown)
+            .. " shown=" .. DebugPlain(btnShown)
+            .. " engineFS=" .. DebugPlain(engFS ~= nil)
+            .. " GetTextOK=" .. DebugPlain(okText)
+            .. " engineText=" .. DebugPlain(engText))
+    end
+end
+
+SLASH_EUITBBDECDEBUG1 = "/asdebug"
+SlashCmdList.EUITBBDECDEBUG = function() ns.TBBDecimals_Debug() end
 

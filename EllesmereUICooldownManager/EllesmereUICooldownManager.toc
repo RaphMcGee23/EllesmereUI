@@ -16,6 +16,7 @@ EllesmereUICdmSpellPicker.lua
 EllesmereUICdmBarGlows.lua
 EllesmereUICdmBuffBars.lua
 EllesmereUICdmTbbDecimals.lua
+EllesmereUICdmArcaneCompanion.lua
 EllesmereUICdmFakeActive.lua
 EllesmereUICdmRPTSync.lua
 

@@ -52,13 +52,18 @@ ns.TBB_TEXTURE_NAMES = TBB_TEXTURE_NAMES
 -------------------------------------------------------------------------------
 --  Shared Helpers
 -------------------------------------------------------------------------------
-local function FormatTime(remaining)
-    -- Whole SECONDS use ceil to match Blizzard's aura timers (16.5s reads "17"); flooring
-    -- showed every buff one second low. Minutes/hours stay floor (unverified); sub-10s keeps tenths.
+local function FormatTime(remaining, cfg)
+    -- Honor the same per-bar decimal toggle and threshold used by the preview and
+    -- engine formatter. Whole seconds use ceil to match Blizzard's aura timers
+    -- (16.5s reads "17"); flooring showed every buff one second low.
+    if cfg and cfg.timerDecimals then
+        local threshold = tonumber(cfg.timerDecimalThreshold) or 5
+        if threshold < 1 then threshold = 1 elseif threshold > 120 then threshold = 120 end
+        if remaining < threshold then return format("%.1f", remaining) end
+    end
     if remaining >= 3600 then return format("%dh", floor(remaining / 3600)) end
     if remaining >= 60   then return format("%dm", floor(remaining / 60))   end
-    if remaining >= 10   then return format("%d",  ceil(remaining))         end
-    return format("%.1f", remaining)
+    return format("%d", ceil(remaining))
 end
 
 local CDM_FONT_FALLBACK = "Interface\\AddOns\\EllesmereUI\\media\\fonts\\Expressway.TTF"
@@ -959,6 +964,121 @@ if EllesmereUI.RegisterVisibilityUpdater then
 end
 
 function ns.GetTBBFrame(idx) return tbbFrames[idx] end
+
+-------------------------------------------------------------------------------
+--  Arcane Surge companion: current Arcane Blast cast time
+-------------------------------------------------------------------------------
+local ARCANE_SURGE_CAST_ID = 365350
+local ARCANE_SURGE_AURA_ID = 365362
+local ARCANE_SOUL_AURA_ID = 451038
+local ARCANE_BLAST_ID = 30451
+local GCD_SPELL_ID = 61304
+local _abCastTextNext = 0
+
+local function IsArcaneSurgeTBB(cfg)
+    if not cfg then return false end
+    if cfg.spellID == ARCANE_SURGE_CAST_ID or cfg.spellID == ARCANE_SURGE_AURA_ID
+       or cfg.baseSpellID == ARCANE_SURGE_CAST_ID or cfg.baseSpellID == ARCANE_SURGE_AURA_ID then
+        return true
+    end
+    if cfg.spellIDs then
+        for i = 1, #cfg.spellIDs do
+            local sid = cfg.spellIDs[i]
+            if sid == ARCANE_SURGE_CAST_ID or sid == ARCANE_SURGE_AURA_ID then return true end
+        end
+    end
+    return false
+end
+
+local function IsArcaneSoulTBB(cfg)
+    if not cfg then return false end
+    if cfg.spellID == ARCANE_SOUL_AURA_ID or cfg.baseSpellID == ARCANE_SOUL_AURA_ID then
+        return true
+    end
+    if cfg.spellIDs then
+        for i = 1, #cfg.spellIDs do
+            if cfg.spellIDs[i] == ARCANE_SOUL_AURA_ID then return true end
+        end
+    end
+    return false
+end
+
+local function CurrentArcaneBlastCastMS()
+    -- While Arcane Blast is actually casting, prefer the cast's exact scheduled
+    -- duration. This includes temporary haste and any live cast adjustment.
+    if UnitCastingInfo then
+        local _, _, _, startMS, endMS, _, _, _, spellID = UnitCastingInfo("player")
+        if type(spellID) == "number" and not (issecretvalue and issecretvalue(spellID))
+           and spellID == ARCANE_BLAST_ID
+           and type(startMS) == "number" and type(endMS) == "number"
+           and not (issecretvalue and (issecretvalue(startMS) or issecretvalue(endMS))) then
+            return endMS - startMS
+        end
+    end
+
+    -- C_Spell's castTime is the player's current haste-adjusted cast time.
+    local info = C_Spell and C_Spell.GetSpellInfo and C_Spell.GetSpellInfo(ARCANE_BLAST_ID)
+    local castMS = info and info.castTime
+    if type(castMS) == "number"
+       and not (issecretvalue and issecretvalue(castMS)) and castMS > 0 then
+        return castMS
+    end
+end
+
+local function CurrentGCDSeconds()
+    -- Prefer the duration of a currently running GCD because it includes all
+    -- temporary haste effects. At idle, derive it from current spell haste.
+    local cd = C_Spell and C_Spell.GetSpellCooldown and C_Spell.GetSpellCooldown(GCD_SPELL_ID)
+    local duration = cd and cd.duration
+    if type(duration) == "number"
+       and not (issecretvalue and issecretvalue(duration))
+       and duration >= 0.7 and duration <= 1.6 then
+        return duration
+    end
+    local haste = UnitSpellHaste and UnitSpellHaste("player")
+    if type(haste) ~= "number" or (issecretvalue and issecretvalue(haste)) then return nil end
+    local gcd = 1.5 / (1 + haste / 100)
+    if gcd < 0.75 then gcd = 0.75 elseif gcd > 1.6 then gcd = 1.6 end
+    return gcd
+end
+
+local function UpdateArcaneCompanionTexts(bars, force)
+    local now = GetTime()
+    if not force and now < _abCastTextNext then return end
+    _abCastTextNext = now + 0.20
+    local castMS = CurrentArcaneBlastCastMS()
+    local gcd = CurrentGCDSeconds()
+    if ns.TBBArcaneCompanion_Refresh then
+        ns.TBBArcaneCompanion_Refresh()
+    end
+    for i, cfg in ipairs(bars or {}) do
+        local bar = tbbFrames[i]
+        local abText = bar and bar._arcaneBlastCastText
+        if abText and cfg.enabled ~= false and IsArcaneSurgeTBB(cfg) and castMS then
+            if ns.TBBArcaneCompanion_IsReady
+               and ns.TBBArcaneCompanion_IsReady("surge") then
+                abText:Hide()
+            else
+                abText:SetFormattedText("AB: %.2fs", castMS / 1000)
+                abText:Show()
+            end
+        elseif abText then
+            abText:Hide()
+        end
+        local gcdText = bar and bar._arcaneSoulGcdText
+        if gcdText and cfg.enabled ~= false and IsArcaneSoulTBB(cfg) and gcd then
+            if ns.TBBArcaneCompanion_IsReady
+               and ns.TBBArcaneCompanion_IsReady("soul") then
+                gcdText:Hide()
+            else
+                gcdText:SetFormattedText("GCD: %.2fs", gcd)
+                gcdText:Show()
+            end
+        elseif gcdText then
+            gcdText:Hide()
+        end
+    end
+end
 
 -------------------------------------------------------------------------------
 --  Bar grouping helpers (multi-group)
@@ -2064,6 +2184,25 @@ local function CreateTrackedBuffBarFrame(parent, idx)
     timerText:SetJustifyH("RIGHT")
     wrapFrame._timerText = timerText
 
+    -- Arcane Surge companion text. It is created on every pooled Tracking Bar
+    -- frame but shown only when that frame represents Arcane Surge.
+    local arcaneBlastCastText = textOverlay:CreateFontString(nil, "OVERLAY")
+    SetFont(arcaneBlastCastText, 11)
+    arcaneBlastCastText:SetTextColor(1, 1, 1, 0.9)
+    arcaneBlastCastText:SetPoint("LEFT", wrapFrame, "RIGHT", 8, 0)
+    arcaneBlastCastText:SetJustifyH("LEFT")
+    arcaneBlastCastText:Hide()
+    wrapFrame._arcaneBlastCastText = arcaneBlastCastText
+
+    -- Arcane Soul companion text: current haste-adjusted global cooldown.
+    local arcaneSoulGcdText = textOverlay:CreateFontString(nil, "OVERLAY")
+    SetFont(arcaneSoulGcdText, 11)
+    arcaneSoulGcdText:SetTextColor(1, 1, 1, 0.9)
+    arcaneSoulGcdText:SetPoint("LEFT", wrapFrame, "RIGHT", 8, 0)
+    arcaneSoulGcdText:SetJustifyH("LEFT")
+    arcaneSoulGcdText:Hide()
+    wrapFrame._arcaneSoulGcdText = arcaneSoulGcdText
+
     -- Name text
     local nameText = textOverlay:CreateFontString(nil, "OVERLAY")
     SetFont(nameText, 11)
@@ -2684,6 +2823,31 @@ local function ApplyTrackedBuffBarSettings(bar, cfg)
         end
     else
         bar._timerText:Hide()
+    end
+
+    -- Arcane Blast's current haste-adjusted cast time, attached immediately
+    -- outside the right edge of the Arcane Surge Tracking Bar.
+    if bar._arcaneBlastCastText then
+        if IsArcaneSurgeTBB(cfg) then
+            SetFont(bar._arcaneBlastCastText, cfg.timerSize or 11)
+            SetTBBTextColor(bar._arcaneBlastCastText, cfg, "timer")
+            bar._arcaneBlastCastText:ClearAllPoints()
+            bar._arcaneBlastCastText:SetPoint("LEFT", bar, "RIGHT", 8, 0)
+            bar._arcaneBlastCastText:SetJustifyH("LEFT")
+        else
+            bar._arcaneBlastCastText:Hide()
+        end
+    end
+    if bar._arcaneSoulGcdText then
+        if IsArcaneSoulTBB(cfg) then
+            SetFont(bar._arcaneSoulGcdText, cfg.timerSize or 11)
+            SetTBBTextColor(bar._arcaneSoulGcdText, cfg, "timer")
+            bar._arcaneSoulGcdText:ClearAllPoints()
+            bar._arcaneSoulGcdText:SetPoint("LEFT", bar, "RIGHT", 8, 0)
+            bar._arcaneSoulGcdText:SetJustifyH("LEFT")
+        else
+            bar._arcaneSoulGcdText:Hide()
+        end
     end
 
     -- Spark anchors to the MOVING edge of the fill. With Reverse Fill the fill anchors at the far end and the near edge moves, so the spark side flips.
@@ -4920,10 +5084,8 @@ local function _UpdateCooldownBar(bar, cfg)
         if remaining and cfg.showTimer then
             if hashChargeMode then
                 bar._timerText:SetFormattedText("%.1f", remaining)
-            elseif remaining < 10 then
-                bar._timerText:SetText(string.format("%.1f", remaining))
             else
-                bar._timerText:SetText(FormatTime(remaining))
+                bar._timerText:SetText(FormatTime(remaining, cfg))
             end
             bar._timerText:Show()
         elseif cfg.showTimer and durObj and durObj.GetRemainingDuration then
@@ -5110,6 +5272,11 @@ function ns.UpdateTrackedBuffBarTimers()
     -- Pair configs to Blizzard frames ONE-TO-ONE up front, consuming each frame once, so two
     -- configs sharing a cooldownInfo (Eclipse Solar+Lunar) cannot both mirror the same frame and show twice.
     local assignment = AssignFramesToConfigs(bars)
+
+    -- Cheap 5 Hz text + threshold-color refresh while the Tracking Bar ticker
+    -- is awake. This catches gear, aura, talent and temporary-haste changes
+    -- without another event frame.
+    UpdateArcaneCompanionTexts(bars)
 
     -- Visibility gate inputs, once per pass, only when some bar has a condition.
     if _anyVisCond then TBBFillVisState() end
@@ -5359,10 +5526,14 @@ function ns.UpdateTrackedBuffBarTimers()
                             bar._nameSet = true
                         end
                     end
-                    -- Timer: engine-bound decimal mirror first (the engine formats the secret
-                    -- remaining time into a hidden FS we copy). Fallback: passthrough from
-                    -- Blizzard's FontString every frame (it changes constantly).
-                    if MirrorEngineTimer(bar, cfg) then
+                    -- Timer: when Decimals is enabled, format the same engine-safe
+                    -- remaining value that drives the mirrored fill. SetFormattedText
+                    -- accepts secret values, so no Lua read/comparison is required and
+                    -- tenths remain active from the first tick through expiry.
+                    if cfg.showTimer and cfg.timerDecimals and bar._timerText and blizzBar then
+                        bar._timerText:SetFormattedText("%.1f", blizzBar:GetValue())
+                        bar._timerText:Show()
+                    elseif MirrorEngineTimer(bar, cfg) then
                         bar._timerText:Show()
                     else
                         local _, blizzTimerFS = GetBlizzBarFontStrings(blizzBar)
@@ -5509,7 +5680,7 @@ function ns.UpdateTrackedBuffBarTimers()
                             local remaining = exp - GetTime()
                             if remaining < 0 then remaining = 0 end
                             if not MirrorEngineTimer(bar, cfg) then
-                                bar._timerText:SetText(FormatTime(remaining))
+                                bar._timerText:SetText(FormatTime(remaining, cfg))
                             end
                             bar._timerText:Show()
                         elseif bar._timerText then
@@ -5535,7 +5706,7 @@ function ns.UpdateTrackedBuffBarTimers()
                         if cfg.showTimer and bar._timerText then
                             -- Engine-bound decimal mirror first; the clean local format is the fallback.
                             if not MirrorEngineTimer(bar, cfg) then
-                                bar._timerText:SetText(FormatTime(remaining))
+                                bar._timerText:SetText(FormatTime(remaining, cfg))
                             end
                             bar._timerText:Show()
                         elseif bar._timerText then
@@ -5931,6 +6102,12 @@ function ns.BuildTrackedBuffBars()
 
     -- Unlock mode
     if ns.RegisterTBBUnlockElements then ns.RegisterTBBUnlockElements() end
+
+    UpdateArcaneCompanionTexts(bars, true)
+
+    if ns.TBBArcaneCompanion_Sync then
+        ns.TBBArcaneCompanion_Sync()
+    end
 
     -- 12.1 engine-driven decimal timer text (nil on 12.0: module self-gates)
     if ns.TBBDecimals_Sync then ns.TBBDecimals_Sync() end
