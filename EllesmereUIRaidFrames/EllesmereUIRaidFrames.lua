@@ -10903,7 +10903,9 @@ do
                         local liveChild = liveT[k]
                         if type(liveChild) ~= "table" then ok = false; break end
                         local dstChild = dstParent[k]
-                        if type(dstChild) ~= "table" then
+                        -- A shallow parent copy still shares its live children.
+                        -- Detach each shared child before writing preview values.
+                        if type(dstChild) ~= "table" or dstChild == liveChild then
                             dstChild = {}
                             for ck, cv in pairs(liveChild) do dstChild[ck] = cv end
                             dstParent[k] = dstChild
@@ -15199,6 +15201,16 @@ local function RefreshPartyPreview()
             else -- DOWN
                 stepY = -(h + spacing)
             end
+            -- Centered growth: mirror _PositionPartySlots, which shifts the stack by
+            -- (5 - shown)/2 slots so the shown frames sit centered in the 5-slot
+            -- container. The preview always shows a full party, so shown is 5, or 4
+            -- with Hide Self (the real layout subtracts the hidden self the same way).
+            local centerShift = 0
+            if s.partyFlipGrowth == "centered" then
+                centerShift = (5 - shownCount) / 2
+            end
+            local cShiftX = PixelSnap(stepX * centerShift)
+            local cShiftY = PixelSnap(stepY * centerShift)
             local idx = 0  -- running position; skips the hidden player frame
             for i = 1, 5 do
                 local f = ns._partyPvFrames[i]
@@ -15208,7 +15220,7 @@ local function RefreshPartyPreview()
                     else
                         f:ClearAllPoints()
                         f:SetPoint(basePoint, anchorTo, basePoint,
-                            PixelSnap(stepX * idx), PixelSnap(stepY * idx))
+                            PixelSnap(stepX * idx) + cShiftX, PixelSnap(stepY * idx) + cShiftY)
                         idx = idx + 1
                     end
                 end

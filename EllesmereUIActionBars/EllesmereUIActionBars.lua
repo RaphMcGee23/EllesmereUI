@@ -1037,9 +1037,31 @@ do
     -- raid pull spams it (Jera, 9.0.1). Registered out of combat only, both
     -- edges driven by the REGEN events; PLAYER_ENTERING_WORLD, the other
     -- Update() path, cannot fire under lockdown.
+    -- Cooldowns read SECRET in restricted content, and every dispatch this
+    -- registration drives runs under OUR taint, so Blizzard's own
+    -- ActionButton_ApplyCooldown -> SetCooldown is rejected on every Blizzard
+    -- button the broadcaster still reaches. Live raid report: 511k errors.
+    -- InCombatLockdown() alone was the wrong gate -- it was chosen for the BLOCKED
+    -- SetAttribute, and secrecy is instance-gated, so the whole out-of-combat
+    -- window inside an instance stayed open. Under secrecy "full" drops to the
+    -- press-and-hold subset when that need exists, else the frame goes bare: the
+    -- cooldown ticks (~11/s at idle) are the flood, while SLOT_CHANGED and PEW are
+    -- the only way Blizzard's twin buttons ever learn pressAndHoldAction, and a
+    -- twin only raises there when its own cooldown is running.
+    local function CooldownsSecret()
+        if not (C_Secrets and C_Secrets.ShouldCooldownsBeSecret) then return false end
+        local ok, secret = pcall(C_Secrets.ShouldCooldownsBeSecret)
+        return (ok and secret) and true or false
+    end
     local function ApplyBroadcaster()
         local want = (_vehNeed or _extraNeed) and "full"
             or ((_phNeed or ClassMayPressHold()) and "ph" or "off")
+        -- Folded into `want`, not into slotOK, so the mode comparison below sees the
+        -- change and re-applies; PLAYER_ENTERING_WORLD and the REGEN edges already
+        -- re-run this, which are the edges secrecy turns on and off.
+        if want == "full" and CooldownsSecret() then
+            want = (_phNeed or ClassMayPressHold()) and "ph" or "off"
+        end
         local slotOK = not InCombatLockdown()
         if want == _broadcasterMode and slotOK == _broadcasterSlot then return end
         _broadcasterMode, _broadcasterSlot = want, slotOK
@@ -14040,7 +14062,10 @@ function EAB:FinishSetup()
                     if s.mouseoverEnabled and not info.noManagedVisibility then
                         if not (state and state.isHovered) then
                             StopFade(frame)
-                            FadeTo(frame, 0, s.mouseoverSpeed or 0.15)
+                            -- Scripted action swaps clear the cursor for every slot.
+                            -- Use the hover fader so each clear does not restart an
+                            -- expensive AnimationGroup on every mouseover bar.
+                            FadeTo(frame, 0, s.mouseoverSpeed or 0.15, true)
                             if state then state.fadeDir = "out" end
                             if key == "MainBar" then SyncPagingAlpha(0) end
                         end
@@ -14702,19 +14727,11 @@ function EAB:FinishSetup()
     _petEventFrame:RegisterUnitEvent("UNIT_AURA", "pet")
     _petEventFrame:SetScript("OnEvent", UpdatePetBar)
 
-    -- Stance bar GCD/cooldown swipe. Blizzard drives the shapeshift cooldown
-    -- swipe exclusively through StanceBar frame's UPDATE_SHAPESHIFT_COOLDOWN
-    -- -> StanceBarMixin:UpdateState. HideBlizzardBars() unregisters all
-    -- events on the StanceBar frame, so that path is dead. The swipe only ever appeared
-    -- by accident: a bar transition (form change, Ascendance, etc.) makes
-    -- ValidateActionBarTransition re-Show() StanceBar, whose OnShow -> Update ->
-    -- UpdateState sets the cooldown on the (reparented but identical) StanceButton
-    -- frames before our OnShow hook re-hides the now-empty bar. A plain GCD from a
-    -- spell that does NOT change form fires UPDATE_SHAPESHIFT_COOLDOWN with no
-    -- transition, so nothing ran and the form-lockout swipe was invisible. Mirror
-    -- Blizzard's cooldown update directly on our reused StanceButtons: visual-only
-    -- (CooldownFrame_Set touches no protected state), safe during combat, same as the
-    -- pet PET_BAR_UPDATE_COOLDOWN path above.
+    -- StanceBarMixin:UpdateState owns Blizzard's active highlight and cooldown
+    -- swipe, but HideBlizzardBars unregisters that bar's events. Reconcile both
+    -- visuals on the reused buttons without invoking the hidden bar's layout
+    -- or visibility updates. SetChecked and CooldownFrame_Set are visual-only,
+    -- matching the pet bar painter above.
     -- Per-form memo of the last (start, duration, enable) triple pushed. The
     -- cooldown event refires on every GCD for form classes and the swipe is a
     -- pure function of those three values, so an identical triple is skipped.
@@ -14725,7 +14742,7 @@ function EAB:FinishSetup()
     -- (instanced combat) cannot be compared: that form pushes unconditionally
     -- and drops its memo.
     local stanceLast = {}
-    local function UpdateStanceCooldowns(_, event)
+    local function UpdateStanceState(_, event)
         if event ~= "UPDATE_SHAPESHIFT_COOLDOWN" then wipe(stanceLast) end
         -- Hidden stance bar: skip. The show edge reruns this painter
         -- (ns._eabStanceReconcile), and the event refires every GCD for
@@ -14735,6 +14752,12 @@ function EAB:FinishSetup()
         local numForms = GetNumShapeshiftForms()
         for i = 1, numForms do
             local btn = _G["StanceButton" .. i]
+            if btn then
+                -- Clicks toggle the checked state optimistically; reconcile it
+                -- from the actual form even when the cooldown has not changed.
+                local _, isActive = GetShapeshiftFormInfo(i)
+                btn:SetChecked(isActive)
+            end
             if btn and btn.cooldown then
                 local start, duration, enable = GetShapeshiftFormCooldown(i)
                 if issecretvalue and (issecretvalue(start) or issecretvalue(duration)
@@ -14752,12 +14775,13 @@ function EAB:FinishSetup()
             end
         end
     end
-    ns._eabStanceReconcile = UpdateStanceCooldowns
+    ns._eabStanceReconcile = UpdateStanceState
     local _stanceEventFrame = ns.TakeShell()
     _stanceEventFrame:RegisterEvent("UPDATE_SHAPESHIFT_COOLDOWN")
     _stanceEventFrame:RegisterEvent("UPDATE_SHAPESHIFT_FORM")
+    _stanceEventFrame:RegisterEvent("UPDATE_SHAPESHIFT_FORMS")
     _stanceEventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
-    _stanceEventFrame:SetScript("OnEvent", UpdateStanceCooldowns)
+    _stanceEventFrame:SetScript("OnEvent", UpdateStanceState)
 
 
     -- Talent changes can cause Blizzard to re-show hidden bars.
